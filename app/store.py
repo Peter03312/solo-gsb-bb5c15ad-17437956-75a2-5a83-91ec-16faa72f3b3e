@@ -1,4 +1,4 @@
-"""持久层：草稿（带乐观锁修订号）、不可变发布版本与默认投递策略（基线/候选灰度）。"""
+"""持久层：草稿（带乐观锁修订号）、不可变发布版本、默认投递策略（基线/候选灰度）与幂等投递判定。"""
 from __future__ import annotations
 
 import json
@@ -185,3 +185,63 @@ def replace_policy(
         "candidate_percent": candidate_percent,
         "updated_at": updated_at,
     }
+
+
+# ---------- 幂等投递判定（投递编号 → 首次判定，永久可查、原样重放） ----------
+
+def get_decision(conn: sqlite3.Connection, delivery_id: str) -> dict | None:
+    """按投递编号读取已持久化的判定；不存在返回 None。JSON 字段在此还原。"""
+    row = conn.execute(
+        "SELECT delivery_id, address, policy_revision, baseline_version, candidate_version, "
+        "candidate_percent, selection, version, status, endpoints, error, created_at "
+        "FROM delivery_decisions WHERE delivery_id = ?",
+        (delivery_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    decision = dict(row)
+    decision["endpoints"] = json.loads(decision["endpoints"]) if decision["endpoints"] is not None else None
+    decision["error"] = json.loads(decision["error"]) if decision["error"] is not None else None
+    return decision
+
+
+def save_decision(
+    conn: sqlite3.Connection,
+    *,
+    delivery_id: str,
+    address: str,
+    policy: dict,
+    selection: str,
+    version: int,
+    status: str,
+    endpoints: list[dict] | None,
+    error: dict | None,
+) -> dict:
+    """把首次判定整体持久化（成功含全部终点路径，失败含原错误详情）。须在事务内调用。
+
+    判定一旦写入不再改写：策略后续变更不影响已持久化的结果。
+    """
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        """
+        INSERT INTO delivery_decisions (
+            delivery_id, address, policy_revision, baseline_version, candidate_version,
+            candidate_percent, selection, version, status, endpoints, error, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            delivery_id,
+            address,
+            policy["revision"],
+            policy["baseline_version"],
+            policy["candidate_version"],
+            policy["candidate_percent"],
+            selection,
+            version,
+            status,
+            json.dumps(endpoints) if endpoints is not None else None,
+            json.dumps(error) if error is not None else None,
+            created_at,
+        ),
+    )
+    return get_decision(conn, delivery_id)

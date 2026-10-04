@@ -47,6 +47,24 @@ CREATE TABLE IF NOT EXISTS delivery_policy (
     candidate_percent INTEGER NOT NULL CHECK (candidate_percent BETWEEN 0 AND 100),
     updated_at        TEXT NOT NULL
 );
+
+-- 幂等投递判定：每个投递编号一行。首次受理时把完整判定（成功含全部终点路径，
+-- 失败含原错误详情）整体写入；之后相同编号 + 相同规范化地址的请求原样重放，
+-- 判定不随策略变更而改写。无效地址 / 未配置策略的请求不会写入（不占用编号）。
+CREATE TABLE IF NOT EXISTS delivery_decisions (
+    delivery_id       TEXT PRIMARY KEY,                 -- 调用方唯一投递编号
+    address           TEXT NOT NULL,                    -- 规范化后的收件地址
+    policy_revision   INTEGER NOT NULL,                 -- 受理时的策略修订号
+    baseline_version  INTEGER NOT NULL,
+    candidate_version INTEGER NOT NULL,
+    candidate_percent INTEGER NOT NULL,
+    selection         TEXT NOT NULL CHECK (selection IN ('baseline', 'candidate')),
+    version           INTEGER NOT NULL REFERENCES versions (version),  -- 实际选中的已发布版本
+    status            TEXT NOT NULL CHECK (status IN ('ok', 'failed')),
+    endpoints         TEXT,                             -- JSON: [{"mailbox", "paths"}]；status='ok' 时非空
+    error             TEXT,                             -- JSON: 失败详情（rejected/no_route/cycle）；status='failed' 时非空
+    created_at        TEXT NOT NULL
+);
 """
 
 

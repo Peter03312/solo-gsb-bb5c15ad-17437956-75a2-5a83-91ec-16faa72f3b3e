@@ -50,6 +50,11 @@ class DeliverRequest(BaseModel):
     address: str
 
 
+class DeliverySubmit(BaseModel):
+    delivery_id: str = Field(min_length=1, max_length=200, description="调用方唯一投递编号")
+    address: str
+
+
 class ValidationFailure(Exception):
     """编辑期校验失败，message 直接作为 4xx 响应。"""
 

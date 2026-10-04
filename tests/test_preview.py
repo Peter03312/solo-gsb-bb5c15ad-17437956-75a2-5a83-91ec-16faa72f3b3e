@@ -19,6 +19,7 @@ def client():
     conn.executescript(
         "DELETE FROM draft_rules;"
         "DELETE FROM delivery_policy;"
+        "DELETE FROM delivery_decisions;"
         "DELETE FROM version_rules;"
         "DELETE FROM versions;"
         "DELETE FROM sqlite_sequence WHERE name = 'versions';"

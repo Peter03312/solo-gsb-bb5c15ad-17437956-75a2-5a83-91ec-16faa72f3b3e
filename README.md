@@ -25,6 +25,12 @@
   选中版本中的**拒收 / 无路由 / 成环仍整次失败，不自动改用另一版本**；
   未配置策略时明确报错（409），**不使用草稿或最新版本兜底**。
   策略只决定“默认用哪个已发布版本”，不影响显式版本解析，草稿与历史版本也不会被策略改写。
+- **幂等投递判定**：`POST /deliveries` 由调用方提交**唯一投递编号 + 收件地址**（供可能超时重试的
+  投递系统使用）。首次受理时按当前默认策略选定已发布版本，把**规范化地址、策略修订号、选中版本、
+  完整终点路径（或拒收 / 无路由 / 成环错误）作为一份判定持久化**并返回。
+  相同编号 + 相同规范化地址的并发或后续请求**原样返回首次判定（含原错误状态）**，即使策略随后改变；
+  编号相同而地址不同返回 409；**无效地址或未配置策略不占用编号**。
+  `GET /deliveries/{id}` 可随时查询已持久化的判定。
 
 ## 一键启动（Docker Compose）
 
@@ -75,6 +81,8 @@ pytest tests/ -q                                   # 运行测试
 | GET  | `/policy`         | 查看当前默认投递策略（未配置时 404）   |
 | PUT  | `/policy`         | 配置基线/候选版本与候选比例，需策略修订号 |
 | POST | `/deliver`        | 默认投递：按策略对收件地址稳定分桶解析 |
+| POST | `/deliveries`     | 幂等投递：投递编号 + 地址，首次判定持久化、重试原样返回 |
+| GET  | `/deliveries/{id}` | 按投递编号查询已持久化的判定（含失败） |
 
 ## 调用示例
 
@@ -302,6 +310,95 @@ curl -X POST http://localhost:8000/deliver -H 'Content-Type: application/json' \
 `422` 的 `rejected` / `no_route` / `cycle` / `invalid_address`）完全不变，不受任何策略影响；
 草稿与历史版本同样不随策略变更而改写。需要强制指定版本复现结果时继续使用 `/resolve`。
 
+## 幂等投递判定：超时重试安全的提交
+
+投递系统可能因超时重试同一封邮件的路由判定。`POST /deliveries` 在 `/deliver` 的策略分桶之上
+增加**调用方唯一投递编号**：首次受理时把完整判定持久化，之后相同编号的重试 / 并发请求
+原样返回首次判定，绝不因策略变更或重试时机不同而给出不同结果。
+
+### 9. 提交投递判定（投递编号 + 收件地址）
+
+```bash
+curl -X POST http://localhost:8000/deliveries -H 'Content-Type: application/json' \
+  -d '{"delivery_id": "msg-2026-10-04-0001", "address": "boss@corp.example.com"}'
+```
+
+```json
+{
+  "delivery_id": "msg-2026-10-04-0001",
+  "address": "boss@corp.example.com",
+  "policy_revision": 1,
+  "baseline_version": 1,
+  "candidate_version": 2,
+  "candidate_percent": 20,
+  "selection": "candidate",
+  "version": 2,
+  "endpoints": [
+    {"mailbox": "alice@mail.example.com", "paths": [["boss@corp.example.com", "alice@mail.example.com"]]}
+  ]
+}
+```
+
+响应在 `/deliver` 的字段（策略快照、`selection`、`version`、`endpoints`）之外增加 `delivery_id`；
+地址同样先规范化（去空白、小写）再分桶与落库。
+
+**重试 / 并发重放**：相同 `delivery_id` 且规范化地址相同的请求（无论并发还是稍后重试，
+也无论策略随后如何调整）都返回与首次**完全相同**的响应——同样的状态码与响应体：
+
+```bash
+# 即使 PUT /policy 已把比例改为 0%，重放仍返回首次选中的版本与结果
+curl -X POST http://localhost:8000/deliveries -H 'Content-Type: application/json' \
+  -d '{"delivery_id": "msg-2026-10-04-0001", "address": "  BOSS@CORP.EXAMPLE.COM "}'
+# => 与首次响应逐字段相同（version 仍为 2，policy_revision 仍为 1）
+```
+
+**失败判定同样持久化**：选中版本拒收 / 无路由 / 成环时，首次与重放都返回相同的 `422`
+（`error` 为 `rejected` / `no_route` / `cycle`，附 `delivery_id`、`policy_revision`、
+`version`、`selection`），**整次失败，不切换版本**：
+
+```json
+{"detail": {"error": "rejected", "address": "blocked@corp.example.com", "chain": ["blocked@corp.example.com"],
+            "delivery_id": "msg-2026-10-04-0002", "policy_revision": 1, "version": 2, "selection": "candidate",
+            "message": "blocked@corp.example.com rejected by rule"}}
+```
+
+**编号冲突**：`delivery_id` 相同而规范化地址不同 → `409`
+`{"error": "delivery_id_conflict", "delivery_id": "..."}`，原判定不被改写。
+
+**编号不被无效请求占用**：无效地址（`422 invalid_address`）与未配置策略
+（`409 policy_not_configured`）都不会写入判定，修正后可用同一编号重新提交。
+
+### 10. 查询已持久化的判定
+
+```bash
+curl http://localhost:8000/deliveries/msg-2026-10-04-0001
+```
+
+```json
+{
+  "delivery_id": "msg-2026-10-04-0001",
+  "address": "boss@corp.example.com",
+  "status": "ok",
+  "policy_revision": 1,
+  "baseline_version": 1,
+  "candidate_version": 2,
+  "candidate_percent": 20,
+  "selection": "candidate",
+  "version": 2,
+  "endpoints": [
+    {"mailbox": "alice@mail.example.com", "paths": [["boss@corp.example.com", "alice@mail.example.com"]]}
+  ],
+  "error": null,
+  "created_at": "2026-10-04T01:16:03+00:00"
+}
+```
+
+`status` 为 `ok` / `failed`；失败判定的 `error` 为首次 `422` 的完整详情，`endpoints` 为 `null`。
+未知编号返回 `404 {"error": "delivery_not_found", ...}`。
+
+> 既有 `/deliver`、`/resolve` 的请求、响应与错误约定完全不变：`/deliver` 仍只做即时分桶解析，
+> 不产生持久化判定；需要强制指定版本复现时继续使用 `/resolve`。
+
 ## 项目结构
 
 ```
@@ -312,8 +409,8 @@ app/
   traffic.py   # 默认投递的稳定分桶：规范化地址 → 0–99 桶 → 基线/候选
   preview.py   # 发布前预览：草稿 vs 基线版本的投递差异对比（纯内存，不落库）
   models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标）
-  store.py     # 草稿、发布版本与默认投递策略的持久化、修订号核对
-  main.py      # FastAPI 路由（/resolve、/preview、/policy、/deliver 等）
-tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略
+  store.py     # 草稿、发布版本、默认投递策略与幂等投递判定的持久化、修订号核对
+  main.py      # FastAPI 路由（/resolve、/preview、/policy、/deliver、/deliveries 等）
+tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定
 Dockerfile / docker-compose.yml
 ```

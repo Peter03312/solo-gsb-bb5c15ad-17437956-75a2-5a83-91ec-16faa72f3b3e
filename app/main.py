@@ -1,4 +1,4 @@
-"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略。"""
+"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定。"""
 from __future__ import annotations
 
 import sqlite3
@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from . import db, preview, store
 from .models import (
     DeliverRequest,
+    DeliverySubmit,
     DraftUpdate,
     PolicyUpdate,
     PreviewRequest,
@@ -261,4 +262,112 @@ def deliver(body: DeliverRequest) -> dict:
             {"mailbox": mailbox, "paths": sorted(paths)}
             for mailbox, paths in sorted(endpoints.items())
         ],
+    }
+
+
+# ---------- 幂等投递判定（投递编号 → 首次判定持久化，重试 / 并发原样重放） ----------
+
+def _decision_doc(decision: dict) -> dict:
+    """成功判定的响应体：/deliver 的策略与终点字段 + 投递编号。重放时内容完全相同。"""
+    return {
+        "delivery_id": decision["delivery_id"],
+        "address": decision["address"],
+        "policy_revision": decision["policy_revision"],
+        "baseline_version": decision["baseline_version"],
+        "candidate_version": decision["candidate_version"],
+        "candidate_percent": decision["candidate_percent"],
+        "selection": decision["selection"],
+        "version": decision["version"],
+        "endpoints": decision["endpoints"],
+    }
+
+
+@app.post("/deliveries")
+def submit_delivery(body: DeliverySubmit) -> dict:
+    """按投递编号幂等提交路由判定（供可能超时重试的投递系统使用）。
+
+    首次受理：按当前默认策略选定已发布版本，把规范化地址、策略修订号、选中版本、
+    完整终点路径（或拒收 / 无路由 / 成环错误）作为一份判定持久化并返回。
+    相同编号 + 相同规范化地址的并发或后续请求原样返回首次判定（含原错误状态），
+    即使策略随后改变；编号相同而地址不同返回 409。
+    无效地址（422）与未配置策略（409）不占用编号；选中版本失败整次失败，不切换版本。
+    """
+    address = body.address.strip().lower()
+    if not is_valid_address(address):  # 无效地址不占用编号
+        raise HTTPException(status_code=422, detail={"error": "invalid_address", "message": f"invalid address: {body.address!r}"})
+    conflict = False
+    try:
+        with db.transaction() as conn:
+            decision = store.get_decision(conn, body.delivery_id)
+            if decision is not None:  # 已有判定：地址一致 → 重放；不一致 → 冲突
+                conflict = decision["address"] != address
+            else:
+                policy = store.get_policy(conn)
+                if policy is None:  # 回滚：未配置策略不占用编号
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"error": "policy_not_configured",
+                                "message": "no delivery policy configured; specify an explicit version via /resolve"},
+                    )
+                chosen = select_version(address, policy["candidate_percent"])
+                version = policy["baseline_version"] if chosen == "baseline" else policy["candidate_version"]
+                ruleset = store.load_ruleset(conn, version)
+                if ruleset is None:  # 防御：策略引用的版本必然已发布且不可变
+                    raise HTTPException(status_code=404, detail={"error": "version_not_found", "version": version})
+                try:
+                    endpoints = resolve(address, ruleset)
+                except ResolutionError as exc:  # 选中版本失败：整次失败并持久化，不切换版本
+                    detail = exc.detail()
+                    detail.update({
+                        "delivery_id": body.delivery_id,
+                        "policy_revision": policy["revision"],
+                        "version": version,
+                        "selection": chosen,
+                    })
+                    decision = store.save_decision(
+                        conn, delivery_id=body.delivery_id, address=address, policy=policy,
+                        selection=chosen, version=version, status="failed", endpoints=None, error=detail,
+                    )
+                else:
+                    endpoint_docs = [
+                        {"mailbox": mailbox, "paths": sorted(paths)}
+                        for mailbox, paths in sorted(endpoints.items())
+                    ]
+                    decision = store.save_decision(
+                        conn, delivery_id=body.delivery_id, address=address, policy=policy,
+                        selection=chosen, version=version, status="ok", endpoints=endpoint_docs, error=None,
+                    )
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    if conflict:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "delivery_id_conflict", "delivery_id": body.delivery_id,
+                    "message": f"delivery id {body.delivery_id!r} already submitted with a different address"},
+        )
+    if decision["status"] == "failed":  # 首次失败与重放都返回原错误状态
+        raise HTTPException(status_code=422, detail=decision["error"])
+    return _decision_doc(decision)
+
+
+@app.get("/deliveries/{delivery_id}")
+def get_delivery(delivery_id: str) -> dict:
+    """查询已持久化的投递判定（含失败判定与原错误详情）；未知编号返回 404。"""
+    with db.read_transaction() as conn:
+        decision = store.get_decision(conn, delivery_id)
+    if decision is None:
+        raise HTTPException(status_code=404, detail={"error": "delivery_not_found", "delivery_id": delivery_id})
+    return {
+        "delivery_id": decision["delivery_id"],
+        "address": decision["address"],
+        "status": decision["status"],
+        "policy_revision": decision["policy_revision"],
+        "baseline_version": decision["baseline_version"],
+        "candidate_version": decision["candidate_version"],
+        "candidate_percent": decision["candidate_percent"],
+        "selection": decision["selection"],
+        "version": decision["version"],
+        "endpoints": decision["endpoints"],
+        "error": decision["error"],
+        "created_at": decision["created_at"],
     }
