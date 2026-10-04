@@ -50,6 +50,16 @@ class DeliverRequest(BaseModel):
     address: str
 
 
+class DeliverySubmitRequest(BaseModel):
+    """幂等投递请求：调用方投递编号 + 收件地址。
+
+    编号在写入前去首尾空白；空编号在请求体层（min_length=1）拒绝，不占用任何状态。
+    """
+
+    delivery_id: str = Field(min_length=1, description="调用方生成的唯一投递编号（原样往返；去首尾空白）")
+    address: str
+
+
 class ValidationFailure(Exception):
     """编辑期校验失败，message 直接作为 4xx 响应。"""
 

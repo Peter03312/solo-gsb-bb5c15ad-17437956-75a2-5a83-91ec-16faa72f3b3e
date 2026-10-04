@@ -47,6 +47,25 @@ CREATE TABLE IF NOT EXISTS delivery_policy (
     candidate_percent INTEGER NOT NULL CHECK (candidate_percent BETWEEN 0 AND 100),
     updated_at        TEXT NOT NULL
 );
+
+-- 投递判定：按“调用方投递编号 + 规范化地址”幂等持久化首次判定（含失败）。
+-- 首受理在 BEGIN IMMEDIATE 事务内“查不到 → 判定 → 写入”，并发重试串行化：
+-- 只有一个请求成为首受理，其余直接取回首次判定；编号相同地址不同 → 409 冲突。
+-- 无效地址 / 未配置策略在写入前拒绝（不占编号），因此表中每行都是一次已完成的首次判定。
+CREATE TABLE IF NOT EXISTS delivery_decisions (
+    delivery_id       TEXT PRIMARY KEY,                 -- 调用方提交的唯一投递编号
+    address           TEXT NOT NULL,                    -- 规范化地址（小写、去空白）
+    policy_revision   INTEGER NOT NULL,                 -- 首受理时的策略修订号
+    baseline_version  INTEGER NOT NULL REFERENCES versions (version),  -- 首受理时策略的基线版本
+    candidate_version INTEGER NOT NULL REFERENCES versions (version),  -- 首受理时策略的候选版本
+    candidate_percent INTEGER NOT NULL,                 -- 首受理时策略的候选比例
+    selection         TEXT NOT NULL CHECK (selection IN ('baseline', 'candidate')),
+    version           INTEGER NOT NULL REFERENCES versions (version),  -- 实际选中版本（不可变，长期可复现）
+    status            TEXT NOT NULL CHECK (status IN ('ok', 'failed')),
+    endpoints         TEXT NOT NULL,                    -- 成功：JSON 终点+完整路径（形状同 /resolve）
+    error_detail      TEXT,                             -- 失败：完整 422 详情 JSON（含策略快照/选中版本，原样重放）
+    created_at        TEXT NOT NULL
+);
 """
 
 

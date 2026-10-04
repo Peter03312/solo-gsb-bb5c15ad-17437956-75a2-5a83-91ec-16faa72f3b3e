@@ -185,3 +185,80 @@ def replace_policy(
         "candidate_percent": candidate_percent,
         "updated_at": updated_at,
     }
+
+
+# ---------- 投递判定幂等持久化（首次判定冻结，含失败） ----------
+
+class DeliveryAddressConflict(Exception):
+    """同一投递编号此前已绑定不同的规范化地址。"""
+
+    def __init__(self, delivery_id: str, existing_address: str, request_address: str):
+        super().__init__(
+            f"delivery id {delivery_id!r} already used for address {existing_address!r}, "
+            f"cannot reuse for {request_address!r}"
+        )
+        self.delivery_id = delivery_id
+        self.existing_address = existing_address
+        self.request_address = request_address
+
+
+def get_delivery(conn: sqlite3.Connection, delivery_id: str) -> dict | None:
+    """按投递编号取回已持久化的首次判定；从未受理过该编号返回 None。"""
+    row = conn.execute(
+        "SELECT delivery_id, address, policy_revision, baseline_version, candidate_version, "
+        "candidate_percent, selection, version, status, endpoints, error_detail, created_at "
+        "FROM delivery_decisions WHERE delivery_id = ?",
+        (delivery_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def save_delivery(
+    conn: sqlite3.Connection,
+    delivery_id: str,
+    address: str,
+    *,
+    policy_revision: int,
+    baseline_version: int,
+    candidate_version: int,
+    candidate_percent: int,
+    selection: str,
+    version: int,
+    endpoints: list[dict] | None = None,
+    error_detail: dict | None = None,
+) -> dict:
+    """持久化一次已完成的首次判定。须在 BEGIN IMMEDIATE 事务内、且该编号不存在时调用。
+
+    成功判定存 endpoints；拒收 / 无路由 / 成环等失败判定存完整 error_detail（含策略快照
+    与选中版本，重放时逐字段一致）。选中版本为不可变已发布版本，故历史判定永远可用
+    同一版本号复现。
+    """
+    if error_detail is not None:
+        status, endpoints_json, error_json = "failed", "[]", json.dumps(error_detail, ensure_ascii=False)
+    else:
+        status, endpoints_json, error_json = "ok", json.dumps(endpoints or [], ensure_ascii=False), None
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT INTO delivery_decisions "
+        "(delivery_id, address, policy_revision, baseline_version, candidate_version, candidate_percent, "
+        "selection, version, status, endpoints, error_detail, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            delivery_id, address, policy_revision, baseline_version, candidate_version, candidate_percent,
+            selection, version, status, endpoints_json, error_json, created_at,
+        ),
+    )
+    return {
+        "delivery_id": delivery_id,
+        "address": address,
+        "policy_revision": policy_revision,
+        "baseline_version": baseline_version,
+        "candidate_version": candidate_version,
+        "candidate_percent": candidate_percent,
+        "selection": selection,
+        "version": version,
+        "status": status,
+        "endpoints": json.loads(endpoints_json),
+        "error_detail": json.loads(error_json) if error_json is not None else None,
+        "created_at": created_at,
+    }

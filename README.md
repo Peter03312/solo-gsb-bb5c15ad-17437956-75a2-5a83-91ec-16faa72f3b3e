@@ -25,6 +25,12 @@
   选中版本中的**拒收 / 无路由 / 成环仍整次失败，不自动改用另一版本**；
   未配置策略时明确报错（409），**不使用草稿或最新版本兜底**。
   策略只决定“默认用哪个已发布版本”，不影响显式版本解析，草稿与历史版本也不会被策略改写。
+- **幂等投递判定（超时重试安全）**：调用方通过 `POST /deliveries` 提交**唯一投递编号 + 收件地址**。
+  服务首次受理时在单个 `BEGIN IMMEDIATE` 事务内按当前默认策略选定已发布版本，并把
+  **规范化地址、策略修订号、策略快照、选中版本、完整终点路径（或拒收/无路由/成环错误）**
+  作为一份判定持久化；相同编号 + 相同规范化地址的**并发或后续请求（超时重试）**逐字段取回首次判定
+  与**原错误状态码**，即使策略随后改变也不重新判定；**编号相同而地址不同 → `409` 冲突**。
+  无效地址 / 未配置策略在写入前拒绝，**不占用编号**；选中版本失败整次失败、不切换版本，但失败也冻结。
 
 ## 一键启动（Docker Compose）
 
@@ -75,6 +81,8 @@ pytest tests/ -q                                   # 运行测试
 | GET  | `/policy`         | 查看当前默认投递策略（未配置时 404）   |
 | PUT  | `/policy`         | 配置基线/候选版本与候选比例，需策略修订号 |
 | POST | `/deliver`        | 默认投递：按策略对收件地址稳定分桶解析 |
+| POST | `/deliveries`     | **幂等投递：投递编号 + 地址，首次判定冻结重放（含失败）** |
+| GET  | `/deliveries/{id}` | 按投递编号取回已持久化的首次判定（成功/失败均可查） |
 
 ## 调用示例
 
@@ -302,6 +310,121 @@ curl -X POST http://localhost:8000/deliver -H 'Content-Type: application/json' \
 `422` 的 `rejected` / `no_route` / `cycle` / `invalid_address`）完全不变，不受任何策略影响；
 草稿与历史版本同样不随策略变更而改写。需要强制指定版本复现结果时继续使用 `/resolve`。
 
+## 幂等投递判定：超时重试拿到完全相同的首次结果
+
+投递系统可能因超时对同一封邮件重试路由判定。`POST /deliveries` 让调用方用
+**唯一投递编号（delivery id）+ 收件地址**换取一份**只判定一次、之后原样重放**的结果。
+
+### 9. 提交投递（首次受理或重试）
+
+```bash
+curl -X POST http://localhost:8000/deliveries -H 'Content-Type: application/json' -d '{
+  "delivery_id": "msg-20261004-0001",
+  "address": "  Boss@Corp.Example.COM "
+}'
+```
+
+- **首次受理**：在单个 `BEGIN IMMEDIATE` 事务内“查不到 → 按当前默认策略选定已发布版本 →
+  解析 → 整体持久化”。地址先**规范化**（去首尾空白、小写，示例归一为 `boss@corp.example.com`），
+  版本选择沿用 `/deliver` 的稳定分桶规则。
+- **成功响应**（`200`）在 `/deliver` 成功体基础上增加 `delivery_id`、`status: "ok"`、`created_at`：
+
+```json
+{
+  "delivery_id": "msg-20261004-0001",
+  "address": "boss@corp.example.com",
+  "status": "ok",
+  "policy_revision": 1,
+  "baseline_version": 1,
+  "candidate_version": 2,
+  "candidate_percent": 20,
+  "selection": "baseline",
+  "version": 1,
+  "endpoints": [
+    {"mailbox": "alice@mail.example.com", "paths": [["boss@corp.example.com", "alice@mail.example.com"]]}
+  ],
+  "created_at": "2026-10-04T06:10:58+00:00"
+}
+```
+
+- **重试 / 并发**：相同编号 + 相同规范化地址的请求（含并发同时到达）一律返回**逐字段相同**
+  的首次判定；首受理事务持写锁，并发请求只有一个真正判定，其余全部取回同一行。
+  **即使之后 `PUT /policy` 改了比例或基线/候选版本、即使草稿发布了新版本，重试仍返回首次的
+  策略修订号、策略快照、选中版本与终点路径**——已发布版本不可变，历史判定长期可复现。
+- **失败也冻结**：选中版本解析出拒收 / 无路由 / 成环时，首受理仍是 `422`（形状同 `/deliver`
+  的失败详情），该失败判定落库；**后续重试得到完全相同的 `422` 与原错误详情**（同样的
+  `policy_revision`、`version`、`selection`、`address`、`chain`），**整次失败，不切换版本**。
+
+```bash
+# 首次（候选 100%，命中候选拒收规则）
+curl -i -X POST http://localhost:8000/deliveries -H 'Content-Type: application/json' -d '{
+  "delivery_id": "msg-20261004-0002",
+  "address": "blocked@corp.example.com"
+}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail": {"error": "rejected", "address": "blocked@corp.example.com", "chain": [...],
+#             "policy_revision": 2, "version": 2, "selection": "candidate"}}
+
+# 超时后用同一编号+同一地址重试：哪怕策略已改回基线（本可成功），仍是上面同一个 422
+curl -X POST http://localhost:8000/deliveries -H 'Content-Type: application/json' -d '{
+  "delivery_id": "msg-20261004-0002",
+  "address": "blocked@corp.example.com"
+}'
+```
+
+- **编号相同、地址不同 → 冲突**：`409 {"error": "delivery_id_conflict", "delivery_id",
+  "existing_address", ...}`，冲突**不返回也不覆盖**任何判定；首次绑定的地址继续取回原结果。
+  地址按**规范化后**比较，故大小写 / 首尾空白差异不算冲突、算同一次判定。
+
+```bash
+curl -X POST http://localhost:8000/deliveries -H 'Content-Type: application/json' \
+  -d '{"delivery_id": "msg-20261004-0001", "address": "someone-else@corp.example.com"}'
+# => 409 {"detail": {"error": "delivery_id_conflict", "delivery_id": "msg-20261004-0001",
+#                   "existing_address": "boss@corp.example.com", ...}}
+```
+
+- **不占编号的拒绝**（全部发生在任何写入之前，同一编号之后还能正常首受理）：
+  - 无效地址 → `422 {"error": "invalid_address", ...}`（同 `/deliver`、`/resolve`）；
+  - 投递编号缺失 / 空串（仅含空白）→ `422 {"error": "invalid_delivery_id", ...}`；
+  - 未配置策略 → `409 {"error": "policy_not_configured", ...}`（同 `/deliver`，不做版本兜底）。
+
+### 10. 按投递编号查询判定
+
+投递调用超时后，也可以只凭编号查询已经落库的首次判定（只读、不改变任何状态）：
+
+```bash
+curl http://localhost:8000/deliveries/msg-20261004-0001
+```
+
+成功判定的响应与提交时一致；失败判定以 `200` 返回信封（查询本身不是一次投递，不返回 422），
+`status` 为 `"failed"`、`endpoints` 为 `[]`，原 `422` 错误详情完整放在 `error` 字段
+（形状与提交时的 `detail` 一致）：
+
+```json
+{
+  "delivery_id": "msg-20261004-0002",
+  "address": "blocked@corp.example.com",
+  "status": "failed",
+  "policy_revision": 2,
+  "baseline_version": 1,
+  "candidate_version": 2,
+  "candidate_percent": 100,
+  "selection": "candidate",
+  "version": 2,
+  "endpoints": [],
+  "error": {"error": "rejected", "address": "blocked@corp.example.com", "chain": ["blocked@corp.example.com"],
+            "policy_revision": 2, "version": 2, "selection": "candidate"},
+  "created_at": "2026-10-04T06:11:19+00:00"
+}
+```
+
+编号从未受理过 → `404 {"error": "delivery_not_found", "delivery_id", ...}`
+（注意：无效地址 / 未配置策略不占编号，因此这些请求之后查询仍是 404）。
+
+> `/deliveries` 与既有 `/deliver` 的分工：`/deliver` 是无状态的即时判定（改策略后再调会按新策略），
+> 适合探测当前灰度；`/deliveries` 面向真实投递链路，按投递编号冻结“这封邮件第一次的判定”，
+> 保证超时重试幂等。两者的成功/失败形状、错误码一致，`/resolve` 显式版本解析不受影响。
+
 ## 项目结构
 
 ```
@@ -312,8 +435,8 @@ app/
   traffic.py   # 默认投递的稳定分桶：规范化地址 → 0–99 桶 → 基线/候选
   preview.py   # 发布前预览：草稿 vs 基线版本的投递差异对比（纯内存，不落库）
   models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标）
-  store.py     # 草稿、发布版本与默认投递策略的持久化、修订号核对
-  main.py      # FastAPI 路由（/resolve、/preview、/policy、/deliver 等）
-tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略
+  store.py     # 草稿、发布版本、默认投递策略与幂等投递判定的持久化、修订号核对
+  main.py      # FastAPI 路由（/resolve、/preview、/policy、/deliver、/deliveries 等）
+tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定
 Dockerfile / docker-compose.yml
 ```
